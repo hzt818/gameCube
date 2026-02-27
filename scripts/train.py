@@ -255,7 +255,7 @@ def train(config: Dict) -> Dict:
         fp16=True,
         gradient_checkpointing=True,
         optim="paged_adamw_8bit",
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
