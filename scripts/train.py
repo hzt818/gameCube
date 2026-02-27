@@ -16,10 +16,11 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     BitsAndBytesConfig,
+    Trainer,
+    DataCollatorForSeq2Seq,
 )
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
-from trl import SFTTrainer
 
 
 def set_seed(seed: int = 42) -> None:
@@ -42,19 +43,13 @@ def generate_training_data(num_samples: int = 1000, seed: int = 42) -> List[Dict
             "dates": ["今天", "明天", "后天", "本周", "下周"]
         },
         "calculator": {
-            "expressions": [
-                "{a} + {b}", "{a} - {b}", "{a} * {b}", "{a} / {b}",
-                "({a} + {b}) * {c}", "{a} ** 2 + {b}",
-            ]
+            "expressions": ["{a} + {b}", "{a} - {b}", "{a} * {b}", "{a} / {b}", "({a} + {b}) * {c}"]
         },
         "datetime": {
             "formats": ["iso", "date", "time", "timestamp"]
         },
         "search": {
-            "queries": [
-                "Python教程", "机器学习入门", "深度学习框架", "自然语言处理",
-                "数据可视化", "API开发", "数据库优化", "前端框架", "云服务部署", "代码测试"
-            ]
+            "queries": ["Python教程", "机器学习入门", "深度学习框架", "自然语言处理", "数据可视化"]
         },
         "text_process": {
             "operations": ["lowercase", "uppercase", "reverse", "word_count", "char_count"]
@@ -90,7 +85,7 @@ def generate_training_data(num_samples: int = 1000, seed: int = 42) -> List[Dict
             })
         elif tool_type == "datetime":
             fmt = random.choice(tools["datetime"]["formats"])
-            questions = ["现在几点了？", "今天日期是什么？", "给我当前时间", "显示当前时间戳"]
+            questions = ["现在几点了？", "今天日期是什么？", "给我当前时间"]
             data.append({
                 "instruction": "分析用户请求并决定下一步行动",
                 "input": random.choice(questions),
@@ -113,7 +108,7 @@ def generate_training_data(num_samples: int = 1000, seed: int = 42) -> List[Dict
             })
         elif tool_type == "text_process":
             op = random.choice(tools["text_process"]["operations"])
-            texts = ["Hello World", "Python Programming", "AI Agent Core", "Machine Learning"]
+            texts = ["Hello World", "Python Programming", "AI Agent Core"]
             text = random.choice(texts)
             data.append({
                 "instruction": "分析用户请求并决定下一步行动",
@@ -145,13 +140,6 @@ def format_example(example: Dict) -> str:
     return f"""<|im_start|>system
 你是一个智能AI助手，能够分析用户请求并选择合适的工具执行任务。
 你的输出必须是JSON格式：{{"thought": "思考过程", "action": "工具名或final_answer", "action_input": {{参数}}}}
-
-可用工具:
-- weather_query: 查询天气 (参数: city, date)
-- calculator: 数学计算 (参数: expression)
-- datetime: 获取时间 (参数: format)
-- search: 搜索信息 (参数: query)
-- text_process: 文本处理 (参数: text, operation)
 <|im_end|>
 <|im_start|>user
 {example['instruction']}
@@ -159,6 +147,21 @@ def format_example(example: Dict) -> str:
 {example['input']}<|im_end|>
 <|im_start|>assistant
 {example['output']}<|im_end|>"""
+
+
+def preprocess_function(examples, tokenizer, max_length):
+    """预处理函数"""
+    model_inputs = tokenizer(
+        examples["text"],
+        max_length=max_length,
+        truncation=True,
+        padding="max_length",
+        return_tensors=None
+    )
+    
+    model_inputs["labels"] = model_inputs["input_ids"].copy()
+    
+    return model_inputs
 
 
 def train(config: Dict) -> Dict:
@@ -184,14 +187,15 @@ def train(config: Dict) -> Dict:
     print(f"训练数据: {len(train_data)} 条")
     print(f"验证数据: {len(eval_data)} 条")
     
-    train_dataset = Dataset.from_list([{"text": format_example(d)} for d in train_data])
-    eval_dataset = Dataset.from_list([{"text": format_example(d)} for d in eval_data])
+    train_texts = [format_example(d) for d in train_data]
+    eval_texts = [format_example(d) for d in eval_data]
     
     print("\n" + "=" * 60)
     print("加载模型...")
     print("=" * 60)
     
     model_name = config["model_name"]
+    max_length = config.get("max_length", 2048)
     
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
@@ -235,6 +239,24 @@ def train(config: Dict) -> Dict:
     model.print_trainable_parameters()
     
     print("\n" + "=" * 60)
+    print("准备数据集...")
+    print("=" * 60)
+    
+    train_dataset = Dataset.from_dict({"text": train_texts})
+    eval_dataset = Dataset.from_dict({"text": eval_texts})
+    
+    train_dataset = train_dataset.map(
+        lambda x: preprocess_function(x, tokenizer, max_length),
+        batched=True,
+        remove_columns=["text"]
+    )
+    eval_dataset = eval_dataset.map(
+        lambda x: preprocess_function(x, tokenizer, max_length),
+        batched=True,
+        remove_columns=["text"]
+    )
+    
+    print("\n" + "=" * 60)
     print("配置训练参数...")
     print("=" * 60)
     
@@ -261,17 +283,15 @@ def train(config: Dict) -> Dict:
         greater_is_better=False,
         report_to="tensorboard",
         run_name=f"agent-core-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+        remove_unused_columns=False,
     )
     
-    trainer = SFTTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        dataset_text_field="text",
-        max_seq_length=config.get("max_length", 2048),
-        packing=False,
     )
     
     print("\n" + "=" * 60)
